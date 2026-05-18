@@ -17,10 +17,16 @@ package net.milkbowl.vault;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.URL;
 import java.net.URLConnection;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.logging.Logger;
 
 import net.milkbowl.vault.chat.Chat;
@@ -60,6 +66,7 @@ import org.bstats.charts.SimplePie;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.Command;
+import org.bukkit.command.CommandMap;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -89,18 +96,23 @@ public class Vault extends JavaPlugin {
     private String currentVersionTitle = "";
     private ServicesManager sm;
     private Vault plugin;
+    private VaultScheduler vaultScheduler;
 
     @Override
     public void onDisable() {
         // Remove all Service Registrations
         getServer().getServicesManager().unregisterAll(this);
-        Bukkit.getScheduler().cancelTasks(this);
+        if (vaultScheduler != null) {
+            vaultScheduler.cancelAll();
+        }
     }
 
     @Override
     public void onEnable() {
         plugin = this;
         log = this.getLogger();
+        log.severe("Folia support is extremely experimental. Stability is not guaranteed.");
+        vaultScheduler = new VaultScheduler(this);
         currentVersionTitle = getDescription().getVersion().split("-")[0];
         currentVersion = Double.valueOf(currentVersionTitle.replaceFirst("\\.", ""));
         sm = getServer().getServicesManager();
@@ -112,16 +124,15 @@ public class Vault extends JavaPlugin {
         loadPermission();
         loadChat();
 
-        getCommand("vault-info").setExecutor(this);
-        getCommand("vault-convert").setExecutor(this);
+        registerCommands();
         getServer().getPluginManager().registerEvents(new VaultListener(), this);
         // Schedule to check the version every 30 minutes for an update. This is to update the most recent 
         // version so if an admin reconnects they will be warned about newer versions.
-        this.getServer().getScheduler().runTask(this, new Runnable() {
+        vaultScheduler.runGlobal(new Runnable() {
 
             @Override
             public void run() {
-                // Programmatically set the default permission value cause Bukkit doesn't handle plugin.yml properly for Load order STARTUP plugins
+                // Paper plugins do not read command metadata from plugin.yml, so update permissions in code.
                 org.bukkit.permissions.Permission perm = getServer().getPluginManager().getPermission("vault.update");
                 if (perm == null)
                 {
@@ -131,7 +142,7 @@ public class Vault extends JavaPlugin {
                 }
                 perm.setDescription("Allows a user or the console to check for vault updates");
 
-                getServer().getScheduler().runTaskTimerAsynchronously(plugin, new Runnable() {
+                vaultScheduler.runAsyncTimer(new Runnable() {
 
                     @Override
                     public void run() {
@@ -160,6 +171,68 @@ public class Vault extends JavaPlugin {
         findCustomData(metrics);
 
         log.info(String.format("Enabled Version %s", getDescription().getVersion()));
+    }
+
+    private void registerCommands() {
+        registerPermission("vault.admin", "Notifies the player when vault is in need of an update.", PermissionDefault.OP);
+        registerPermission("vault.update", "Allows a user or the console to check for vault updates", PermissionDefault.OP);
+        registerCommand("vault-info", "Displays information about Vault", "/vault-info", "vault.admin");
+        registerCommand("vault-convert", "Converts all data in economy1 and dumps it into economy2", "/vault-convert [economy1] [economy2]", "vault.admin");
+    }
+
+    private void registerPermission(String name, String description, PermissionDefault permissionDefault) {
+        org.bukkit.permissions.Permission perm = getServer().getPluginManager().getPermission(name);
+        if (perm == null) {
+            perm = new org.bukkit.permissions.Permission(name);
+            perm.setDefault(permissionDefault);
+            getServer().getPluginManager().addPermission(perm);
+        }
+        perm.setDescription(description);
+    }
+
+    private void registerCommand(String name, String description, String usage, String permission) {
+        CommandMap commandMap = getCommandMap();
+        if (commandMap == null) {
+            log.severe("Could not register command " + name + " because the server command map is unavailable.");
+            return;
+        }
+
+        Command command = new Command(name) {
+            @Override
+            public boolean execute(CommandSender sender, String commandLabel, String[] args) {
+                if (!testPermission(sender)) {
+                    return true;
+                }
+                return Vault.this.onCommand(sender, this, commandLabel, args);
+            }
+        };
+        command.setDescription(description);
+        command.setUsage(usage);
+        command.setPermission(permission);
+        commandMap.register(getDescription().getName().toLowerCase(), command);
+    }
+
+    private CommandMap getCommandMap() {
+        try {
+            Method method = getServer().getClass().getMethod("getCommandMap");
+            Object commandMap = method.invoke(getServer());
+            if (commandMap instanceof CommandMap) {
+                return (CommandMap) commandMap;
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            Field field = getServer().getClass().getDeclaredField("commandMap");
+            field.setAccessible(true);
+            Object commandMap = field.get(getServer());
+            if (commandMap instanceof CommandMap) {
+                return (CommandMap) commandMap;
+            }
+        } catch (Exception ignored) {
+        }
+
+        return null;
     }
 
     /**
@@ -520,5 +593,79 @@ public class Vault extends JavaPlugin {
             }
         }
 
+    }
+
+    private static class VaultScheduler {
+
+        private final Vault plugin;
+        private final List<Object> tasks = new ArrayList<Object>();
+
+        VaultScheduler(Vault plugin) {
+            this.plugin = plugin;
+        }
+
+        void runGlobal(final Runnable runnable) {
+            Object scheduler = invokeNoArg(plugin.getServer(), "getGlobalRegionScheduler");
+            if (scheduler != null) {
+                Object task = invoke(scheduler, "run", new Class<?>[] {Plugin.class, Consumer.class}, plugin, new Consumer<Object>() {
+                    @Override
+                    public void accept(Object ignored) {
+                        runnable.run();
+                    }
+                });
+                remember(task);
+                return;
+            }
+
+            remember(plugin.getServer().getScheduler().runTask(plugin, runnable));
+        }
+
+        void runAsyncTimer(final Runnable runnable, long delayTicks, long periodTicks) {
+            Object scheduler = invokeNoArg(plugin.getServer(), "getAsyncScheduler");
+            if (scheduler != null) {
+                Object task = invoke(scheduler, "runAtFixedRate",
+                        new Class<?>[] {Plugin.class, Consumer.class, long.class, long.class, TimeUnit.class},
+                        plugin, new Consumer<Object>() {
+                            @Override
+                            public void accept(Object ignored) {
+                                runnable.run();
+                            }
+                        }, ticksToMillis(delayTicks), ticksToMillis(periodTicks), TimeUnit.MILLISECONDS);
+                remember(task);
+                return;
+            }
+
+            remember(plugin.getServer().getScheduler().runTaskTimerAsynchronously(plugin, runnable, delayTicks, periodTicks));
+        }
+
+        void cancelAll() {
+            for (Object task : tasks) {
+                invokeNoArg(task, "cancel");
+            }
+            tasks.clear();
+        }
+
+        private void remember(Object task) {
+            if (task != null) {
+                tasks.add(task);
+            }
+        }
+
+        private static long ticksToMillis(long ticks) {
+            return Math.max(1L, ticks * 50L);
+        }
+
+        private static Object invokeNoArg(Object target, String methodName) {
+            return invoke(target, methodName, new Class<?>[0]);
+        }
+
+        private static Object invoke(Object target, String methodName, Class<?>[] parameterTypes, Object... args) {
+            try {
+                Method method = target.getClass().getMethod(methodName, parameterTypes);
+                return method.invoke(target, args);
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
     }
 }
